@@ -1,52 +1,43 @@
-from functools import partial
-
 import torch
 from collections import OrderedDict
 from os import path as osp
-
-from torch import device
 from tqdm import tqdm
-import torch
+import torch.nn.functional as F
 from basicsr.archs import build_network
 from basicsr.losses import build_loss
 from basicsr.metrics import calculate_metric
 from basicsr.utils import get_root_logger, imwrite, tensor2img
 from basicsr.utils.registry import MODEL_REGISTRY
+from functools import partial
+from einops import rearrange
 from .flow_model import FlowModel
-
-
+import numpy as np
+'''
+def stopgrad(x):
+    return x.detach()
+def adaptive_l2_loss(error, gamma=0.5, c=1e-3):
+    # 计算每个样本的均方误差 (B,)
+    delta_sq = torch.mean(error ** 2, dim=(1, 2, 3), keepdim=False)
+    p = 1.0 - gamma
+    # 计算自适应权重：误差越大的样本权重越小，防止离群点干扰
+    w = 1.0 / (delta_sq + c).pow(p)
+    loss = delta_sq
+    return (stopgrad(w) * loss).mean()
+'''
 @MODEL_REGISTRY.register()
+
 class MeanFlowModel(FlowModel):
     """Base SR model for single image super-resolution."""
 
     def __init__(self, opt):
         super(MeanFlowModel, self).__init__(opt)
-
-        # define network
-        self.net_g = build_network(opt['network_g'])
-        self.net_g = self.model_to_device(self.net_g)
-        self.print_network(self.net_g)
-
-        # load pretrained models
-        load_path = self.opt['path'].get('pretrain_network_g', None)
-        if load_path is not None:
-            param_key = self.opt['path'].get('param_key_g', 'params')
-            self.load_network(self.net_g, load_path, self.opt['path'].get('strict_load_g', True), param_key)
-
-        #if self.is_train:
-           # self.init_training_settings()
-
     def init_training_settings(self):
         self.net_g.train()
         train_opt = self.opt['train']
-
         self.ema_decay = train_opt.get('ema_decay', 0)
         if self.ema_decay > 0:
             logger = get_root_logger()
             logger.info(f'Use Exponential Moving Average with decay: {self.ema_decay}')
-            # define network net_g with Exponential Moving Average (EMA)
-            # net_g_ema is used only for testing on one GPU and saving
-            # There is no need to wrap with DistributedDataParallel
             self.net_g_ema = build_network(self.opt['network_g']).to(self.device)
             # load pretrained model
             load_path = self.opt['path'].get('pretrain_network_g', None)
@@ -55,204 +46,186 @@ class MeanFlowModel(FlowModel):
             else:
                 self.model_ema(0)  # copy net_g weight
             self.net_g_ema.eval()
-
         # define losses
+        if train_opt.get('flow_opt'):
+            self.flow_loss = build_loss(train_opt['flow_opt']).to(self.device)
+        else:
+            self.flow_loss = None
         if train_opt.get('pixel_opt'):
             self.cri_pix = build_loss(train_opt['pixel_opt']).to(self.device)
         else:
             self.cri_pix = None
-
         if train_opt.get('perceptual_opt'):
             self.cri_perceptual = build_loss(train_opt['perceptual_opt']).to(self.device)
         else:
             self.cri_perceptual = None
-
         if self.cri_pix is None and self.cri_perceptual is None:
             raise ValueError('Both pixel and perceptual losses are None.')
-
         # set up optimizers and schedulers
         self.setup_optimizers()
         self.setup_schedulers()
 
-    def setup_optimizers(self):
-        train_opt = self.opt['train']
-        optim_params = []
-        for k, v in self.net_g.named_parameters():
-            if v.requires_grad:
-                optim_params.append(v)
-            else:
-                logger = get_root_logger()
-                logger.warning(f'Params {k} will not be optimized.')
 
-        optim_type = train_opt['optim_g'].pop('type')
-        self.optimizer_g = self.get_optimizer(optim_type, optim_params, **train_opt['optim_g'])
-        self.optimizers.append(self.optimizer_g)
 
     def feed_data(self, data):
-
         self.lq = data['lq'].to(self.device)
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
-        if self.is_train:
-            h, w = self.gt.shape[-2:]
 
-            # 使用双三次插值把 LQ (16x16) 放大到 (128x128)
-            lq_up = torch.nn.functional.interpolate(
-                self.lq, size=(h, w), mode='bicubic', align_corners=False
-            )
-            batch_size = self.lq.shape[0]
-            device = self.device
-            time_sampler = getattr(self, 'time_sampler', 'logit_normal')
-            time_sigma = getattr(self, 'time_sigma', 1.0)
-            time_mu = getattr(self, 'time_mu', 0.0)
-            ratio_r_not_equal_t = getattr(self, 'ratio_r_not_equal_t', 0.5)
-            if time_sampler == "uniform":
-                time_samples = torch.rand(batch_size, 2, device=device)
-            elif time_sampler == "logit_normal":
-                normal_samples = torch.randn(batch_size, 2, device=device)
-                normal_samples = normal_samples * time_sigma + time_mu
-                time_samples = torch.sigmoid(normal_samples)
-            else:
-                raise ValueError(f"Unknown time sampler: {time_sampler}")
-            sorted_samples, _ = torch.sort(time_samples, dim=1)
-            r, t = sorted_samples[:, 0], sorted_samples[:, 1]
-            fraction_equal = 1.0 - ratio_r_not_equal_t  # e.g., 0.75 means 75% of samples have r=t
-            equal_mask = torch.rand(batch_size, device=device) < fraction_equal
-            r = torch.where(equal_mask, t, r)
-            self.t = t
-            self.r = r
-            t_map = t.view(batch_size, 1, 1, 1)
-            alpha_t = 1 - t_map
-            sigma_t = t_map
-            d_alpha_t = -1
-            d_sigma_t = 1
-            # alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(t.view(-1, 1, 1, 1))
-            self.z_t = alpha_t * self.gt + sigma_t * lq_up
-            self.v_t = d_alpha_t * self.gt + d_sigma_t * lq_up
+    '''
+    define the interpolation processing of flow-based method. Should be instanced for differnet flow-based method.
+    input:time step t
+    '''
+    def flow_interpolation(self, t, r=None):
+        self.xt= (1-t)*self.gt + self.lq * t
 
-    def optimize_parameters(self, current_iter):
+        return self.xt
+
+
+    def sample_t_r(self, batch_size, device):
+        # 简单的均匀分布采样 t，并且设 r=t
+        t = torch.rand(batch_size, device=device)
+        r = t.clone()
+        return t, r
+
+
+    '''
+    define the timestep sampling method.
+    '''
+    def sample_timestep(self):
+        #self.normer = Normalizer.from_list(normalizer)
+        batch_size = self.lq.shape[0]
+        device = self.device
+
+        t, r = self.sample_t_r(batch_size, device)
+        self.t = t
+        self.r = r
+
+        self.t_ = rearrange(t, "b -> b 1 1 1").detach().clone()
+        self.r_ = rearrange(r, "b -> b 1 1 1").detach().clone()
+        _,_,h,w, = self.gt.shape
+        self.lq = F.interpolate(self.lq,size=(h,w),mode='bicubic',align_corners=False)
+
+        self.v_hat = self.lq - self.gt
+
+
         '''
-        # ---【诊断代码开始】---
-        if current_iter == 1:
-            print("\n" + "="*30 + " [DIAGNOSIS REPORT] " + "="*30)
-            for name, p in self.net_g.named_parameters():
-                if 'x_embedder' in name:
-                    status = "✅ Trainable (True)" if p.requires_grad else "❌ Frozen (False)"
-                    print(f"Param: {name} -> {status}")
-                    break
-            print("="*80 + "\n")
-        # ---【诊断代码结束】---
-
-        #self.optimizer_g.zero_grad()
-        self.optimizer_g.zero_grad()
-
-        # --- 临时测试：Simple MSE Loss ---
-        # 我们不求导数了，直接让网络预测 target_v
-
-        # 1. 构造时间
-        batch_size = self.z_t.shape[0]
-        t_curr = self.t.view(batch_size, 1, 1, 1)
-        r_curr = self.r.view(batch_size, 1, 1, 1)  # 或者 r=t
-
-        # 2. 网络前向传播 (不包含 JVP)
-        # 你的 arch 接受 tuple: (x, t, r)
-        # 这里的 z_t 和 target_v 都是 feed_data 算好的
-        u = self.net_g((self.z_t, self.t, self.r))
-
-        # 3. 简单暴力的 Loss: 预测值 u vs 真值 target_v
-        loss = torch.nn.functional.mse_loss(u, self.v_t)
-
-        # 4. 反向传播
-        loss.backward()
-
-        # 【调试打印】看看现在第一层有梯度了吗？
-        if current_iter % 100 == 0:
-            for name, param in self.net_g.named_parameters():
-                if 'x_embedder' in name and 'weight' in name:
-                    print(f"SimpleMSE Debug - Layer: {name} | Grad: {param.grad.abs().mean().item():.8f}")
-                    break
-
-        self.optimizer_g.step()
-
-        self.log_dict = OrderedDict()
-        self.log_dict['l_flow'] = loss.item()
-        '''
-        self.optimizer_g.zero_grad()
-        #inputs = (self.z_t, self.t, self.r)
-        #model_partial = partial(self.net_g, y=None)
-        #func = lambda z, t, r: model_partial(z, t, r)
+    main processing of flow.
+    '''
+    def flow_process(self):
+        self.sample_timestep()
+        self.xt = self.flow_interpolation(self.t_)
         jvp_args = (
             lambda z, t, r: self.net_g((z, t, r)),
-            (self.z_t, self.t, self.r),
-            (self.v_t, torch.ones_like(self.t), torch.zeros_like(self.r)),
+            (self.xt, self.t, self.r),
+            (self.v_hat, torch.ones_like(self.t), torch.zeros_like(self.r)),
         )
-
         u, dudt = torch.autograd.functional.jvp(*jvp_args, create_graph=True)
-        t_map = self.t.view(-1, 1, 1, 1)
-        r_map = self.r.view(-1, 1, 1, 1)
-
-
-        u_tgt = self.v_t - (t_map - r_map) * dudt
+        u_tgt = self.v_hat - (self.t_ - self.r_) * dudt
+        #error = u - stopgrad(u_tgt)
+        #loss = adaptive_l2_loss(error)
 
         error = u - u_tgt.detach()
-        delta_sq = torch.mean(error ** 2, dim=(1, 2, 3), keepdim=False)
-        # gamma=0.5, c=1e-3 是默认参数
-        w = 1.0 / (delta_sq + 1e-3).pow(0.5)
-        loss = (w.detach() * delta_sq).mean()
-        loss.backward()
-        if current_iter % 100 == 0:
-            print(f"\n[DEBUG Iter  {current_iter}]---------------------")
-            for name,param in self.net_g.named_parameters():
-                if param.grad is None:
-                    continue
-                if 'x_embedder' in name and 'weight' in name:
-                    grad_mean = param.grad.abs().mean().item()
-                    weight_mean = param.data.abs().mean().item()
-                    print(f"Layer: {name}")
-                    print(f"  -> Weight Mean: {weight_mean:.8f}")  # 权重大小
-                    print(f"  -> Grad Mean:   {grad_mean:.8f}")  # 梯度大小 (如果是0，说明没学)
-                if 'final_layer' in name and 'linear.weight' in name:
-                    grad_mean = param.grad.abs().mean().item()
-                    weight_mean = param.data.abs().mean().item()
-                    print(f"Layer: {name}")
-                    print(f"  -> Weight Mean: {weight_mean:.8f}")
-                    print(f"  -> Grad Mean:   {grad_mean:.8f}")
-                    break  # 打印完这两个就够了
+        loss = torch.nn.functional.l1_loss(error, torch.zeros_like(error))
+        return loss
+
+    '''
+    sample image with flow-based ODE.
+    '''
+
+    @torch.no_grad()
+    def sample_image(self, lq, model=None):  # <--- 修改了参数定义
+        # 如果没传 model，就用默认的 self.net_g
+        if model is None:
+            model = self.net_g
+
+        # 1. 先放大 LQ 到目标尺寸 (128x128)
+        scale = self.opt.get('scale', 4)
+        h, w = lq.shape[-2:]
+        target_size = (h * scale, w * scale)
+        x = F.interpolate(lq, size=target_size, mode='bicubic', align_corners=False)
+
+        # 2. 准备循环参数
+        batch_size = x.shape[0]
+        device = x.device
+        num_steps = 10
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+
+        # 3. Euler 积分循环 (从 LQ 逐步推导到 GT)
+        for i in range(num_steps):
+            t_curr = timesteps[i]
+            t_next = timesteps[i + 1]
+            dt = t_curr - t_next
+
+            t_input = torch.full((batch_size,), t_curr, device=device)
+            r_input = t_input.clone()
+
+            # 预测 v
+            v_pred = model((x, t_input, r_input))
+
+            # 更新 x
+            x = x - dt * v_pred
+
+        return x
+
+    '''
+    Add flow-based loss function.
+    '''
+
+    def optimize_parameters(self, current_iter):
+        self.optimizer_g.zero_grad()
+        flow_loss = self.flow_process()
+        self.vt_pre = self.net_g((self.xt, self.t, self.r))
+        self.output = self.xt - self.t_ * self.vt_pre
+        l_total = flow_loss
+        loss_dict = OrderedDict()
+
+        # flow loss
+        if self.flow_loss:
+            l_flow = self.flow_loss(self.output, self.gt)
+            l_total += l_flow
+            loss_dict['l_flow'] = l_flow
+
+        # pixel loss
+        if self.cri_pix:
+            l_pix = self.cri_pix(self.output, self.gt)
+            l_total += l_pix
+            loss_dict['l_pix'] = l_pix
+        # perceptual loss
+        if self.cri_perceptual:
+            l_percep, l_style = self.cri_perceptual(self.output, self.gt)
+            if l_percep is not None:
+                l_total += l_percep
+                loss_dict['l_percep'] = l_percep
+            if l_style is not None:
+                l_total += l_style
+                loss_dict['l_style'] = l_style
+
+        l_total.backward()
         self.optimizer_g.step()
-        self.log_dict = OrderedDict()
-        self.log_dict['l_flow'] = loss.item()
+        self.log_dict = self.reduce_loss_dict(loss_dict)
+        if self.ema_decay > 0:
+            self.model_ema(decay=self.ema_decay)
 
-
+    '''
+    self.output is reconstructed image from sample_image method.
+    '''
     def test(self):
-        # 1. 选择模型 (优先用 EMA)
         if hasattr(self, 'net_g_ema'):
             self.net_g_ema.eval()
             net = self.net_g_ema
         else:
             self.net_g.eval()
             net = self.net_g
-
         with torch.no_grad():
-            # =================================================
-            # Step 1: 准备初始状态 (Upsample LQ -> z_1)
-            # =================================================
-            # 获取目标尺寸 (根据 scale)
             scale = self.opt.get('scale', 4)
-            h, w = self.lq.shape[-2:]
+            h,w = self.lq.shape[-2:]
             target_size = (h * scale, w * scale)
-
-            # 将低清图放大，作为采样的起点 (t=1 时刻的状态)
-            z = torch.nn.functional.interpolate(
-                self.lq, size=target_size, mode='bicubic', align_corners=False
-            )
-
-            # =================================================
-            # Step 2: MeanFlow 采样循环 (Sampler)
-            # =================================================
+            z = F.interpolate(self.lq, size=target_size, mode='bicubic', align_corners=False)
             model_input_size = self.opt['network_g']['input_size']
             if z.shape[2] != model_input_size or z.shape[3] != model_input_size:
-                start_h = (z.shape[2]-model_input_size) // 2
-                start_w = (z.shape[3]-model_input_size) // 2
+                start_h = (z.shape[2] - model_input_size) // 2
+                start_w = (z.shape[3] - model_input_size) // 2
                 end_h = start_h + model_input_size
                 end_w = start_w + model_input_size
                 z = z[:, :, start_h:end_h, start_w:end_w]
@@ -288,62 +261,59 @@ class MeanFlowModel(FlowModel):
             # Step 3: 保存结果
             # =================================================
             self.output = z
-
-        # 恢复训练模式
         self.net_g.train()
 
-    def test_selfensemble(self):
-        # TODO: to be tested
-        # 8 augmentations
-        # modified from https://github.com/thstkdgus35/EDSR-PyTorch
+    # def test_selfensemble(self):
+    #     # TODO: to be tested
+    #     # 8 augmentations
+    #     # modified from https://github.com/thstkdgus35/EDSR-PyTorch
+    #
+    #     def _transform(v, op):
+    #         # if self.precision != 'single': v = v.float()
+    #         v2np = v.data.cpu().numpy()
+    #         if op == 'v':
+    #             tfnp = v2np[:, :, :, ::-1].copy()
+    #         elif op == 'h':
+    #             tfnp = v2np[:, :, ::-1, :].copy()
+    #         elif op == 't':
+    #             tfnp = v2np.transpose((0, 1, 3, 2)).copy()
+    #
+    #         ret = torch.Tensor(tfnp).to(self.device)
+    #         # if self.precision == 'half': ret = ret.half()
+    #
+    #         return ret
+    #
+    #     # prepare augmented data
+    #     lq_list = [self.lq]
+    #     for tf in 'v', 'h', 't':
+    #         lq_list.extend([_transform(t, tf) for t in lq_list])
+    #
+    #     # inference
+    #     if hasattr(self, 'net_g_ema'):
+    #         self.net_g_ema.eval()
+    #         with torch.no_grad():
+    #             out_list = [self.net_g_ema(aug) for aug in lq_list]
+    #     else:
+    #         self.net_g.eval()
+    #         with torch.no_grad():
+    #             out_list = [self.net_g_ema(aug) for aug in lq_list]
+    #         self.net_g.train()
+    #
+    #     # merge results
+    #     for i in range(len(out_list)):
+    #         if i > 3:
+    #             out_list[i] = _transform(out_list[i], 't')
+    #         if i % 4 > 1:
+    #             out_list[i] = _transform(out_list[i], 'h')
+    #         if (i % 4) % 2 == 1:
+    #             out_list[i] = _transform(out_list[i], 'v')
+    #     output = torch.cat(out_list, dim=0)
+    #
+    #     self.output = output.mean(dim=0, keepdim=True)
 
-        def _transform(v, op):
-            # if self.precision != 'single': v = v.float()
-            v2np = v.data.cpu().numpy()
-            if op == 'v':
-                tfnp = v2np[:, :, :, ::-1].copy()
-            elif op == 'h':
-                tfnp = v2np[:, :, ::-1, :].copy()
-            elif op == 't':
-                tfnp = v2np.transpose((0, 1, 3, 2)).copy()
-
-            ret = torch.Tensor(tfnp).to(self.device)
-            # if self.precision == 'half': ret = ret.half()
-
-            return ret
-
-        # prepare augmented data
-        lq_list = [self.lq]
-        for tf in 'v', 'h', 't':
-            lq_list.extend([_transform(t, tf) for t in lq_list])
-
-        # inference
-        if hasattr(self, 'net_g_ema'):
-            self.net_g_ema.eval()
-            with torch.no_grad():
-                out_list = [self.net_g_ema(aug) for aug in lq_list]
-        else:
-            self.net_g.eval()
-            with torch.no_grad():
-                out_list = [self.net_g_ema(aug) for aug in lq_list]
-            self.net_g.train()
-
-        # merge results
-        for i in range(len(out_list)):
-            if i > 3:
-                out_list[i] = _transform(out_list[i], 't')
-            if i % 4 > 1:
-                out_list[i] = _transform(out_list[i], 'h')
-            if (i % 4) % 2 == 1:
-                out_list[i] = _transform(out_list[i], 'v')
-        output = torch.cat(out_list, dim=0)
-
-        self.output = output.mean(dim=0, keepdim=True)
-
-    def dist_validation(self, dataloader, current_iter, tb_logger, save_img):
-        if self.opt['rank'] == 0:
-            self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
-
+    '''
+    added code to delete flow-based attribution self.v_pred et.al.
+    '''
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
         dataset_name = dataloader.dataset.opt['name']
         with_metrics = self.opt['val'].get('metrics') is not None
@@ -376,8 +346,14 @@ class MeanFlowModel(FlowModel):
                 del self.gt
 
             # tentative for out of GPU memory
-            del self.lq
-            del self.output
+            if hasattr(self,'xt'):
+                del self.xt
+            if hasattr(self, 'vt_pre'):
+                del self.vt_pre
+            if hasattr(self, 'lq'):
+                del self.lq
+            if hasattr(self, 'output'):
+                del self.output
             torch.cuda.empty_cache()
 
             if save_img:
@@ -410,33 +386,3 @@ class MeanFlowModel(FlowModel):
                 self._update_best_metric_result(dataset_name, metric, self.metric_results[metric], current_iter)
 
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
-
-    def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):
-        log_str = f'Validation {dataset_name}\n'
-        for metric, value in self.metric_results.items():
-            log_str += f'\t # {metric}: {value:.4f}'
-            if hasattr(self, 'best_metric_results'):
-                log_str += (f'\tBest: {self.best_metric_results[dataset_name][metric]["val"]:.4f} @ '
-                            f'{self.best_metric_results[dataset_name][metric]["iter"]} iter')
-            log_str += '\n'
-
-        logger = get_root_logger()
-        logger.info(log_str)
-        if tb_logger:
-            for metric, value in self.metric_results.items():
-                tb_logger.add_scalar(f'metrics/{dataset_name}/{metric}', value, current_iter)
-
-    def get_current_visuals(self):
-        out_dict = OrderedDict()
-        out_dict['lq'] = self.lq.detach().cpu()
-        out_dict['result'] = self.output.detach().cpu()
-        if hasattr(self, 'gt'):
-            out_dict['gt'] = self.gt.detach().cpu()
-        return out_dict
-
-    def save(self, epoch, current_iter):
-        if hasattr(self, 'net_g_ema'):
-            self.save_network([self.net_g, self.net_g_ema], 'net_g', current_iter, param_key=['params', 'params_ema'])
-        else:
-            self.save_network(self.net_g, 'net_g', current_iter)
-        self.save_training_state(epoch, current_iter)

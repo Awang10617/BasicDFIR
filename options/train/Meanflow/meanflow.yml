@@ -8,7 +8,7 @@ manual_seed: 0
 # dataset and data loader settings
 datasets:
   train:
-    name: Set5
+    name: DF2K
     type: PairedImageDataset
     dataroot_gt: /8T1/dataset/SRDataset/ImageSR/DF2K/train_HR
     dataroot_lq: /8T1/dataset/SRDataset/ImageSR/DF2K/train_LR_bicubic/X4
@@ -62,7 +62,7 @@ path:
 train:
   ema_decay: 0.999
   optim_g:
-    type: Adam
+    type: AdamW
     lr: !!float 2e-4
     weight_decay: 0
     betas: [0.9, 0.99]
@@ -84,7 +84,7 @@ train:
 
 # validation settings
 val:
-  val_freq: 200 #!!float 5e3
+  val_freq: 1000 #!!float 5e3
   save_img: true
 
   metrics:
@@ -96,7 +96,7 @@ val:
 # logging settings
 logger:
   print_freq: 100
-  save_checkpoint_freq: 200 #!!float 5e3
+  save_checkpoint_freq: 1000 #!!float 5e3
   use_tb_logger: true
   wandb:
     project: ~
